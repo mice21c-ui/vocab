@@ -5,11 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="apple-mobile-web-app-title" content="단어장">
 <meta name="theme-color" content="#0a0a0f">
 <title>Pain of Others 단어장</title>
-<style>html,body{margin:0;background:#0a0a0f;color-scheme:dark}</style>
+<style>html,body{margin:0;background:#0a0a0f;color-scheme:dark}body::before{content:"";position:fixed;top:0;left:0;right:0;height:env(safe-area-inset-top,0px);background:#0a0a0f;z-index:100}</style>
 </head>
 <body>
 <div id="root"></div>
@@ -420,8 +420,6 @@ function VocabApp() {
               <div style={{ color: "#d4af6a99" }}>완료 {masteredCount}개</div>
               <div style={{ fontSize: 10 }}>{syncMsg}</div>
             </div>
-            <button className="icon-btn" style={{ fontSize: 18 }}
-              onClick={() => { setShowBackup(true); setBackupTab("export"); setImportMsg(""); }}>⇅</button>
           </div>
         </div>
         {/* Progress bar */}
@@ -722,3 +720,4 @@ ReactDOM.createRoot(document.getElementById("root")).render(<VocabApp/>);
 </script>
 </body>
 </html>
+
