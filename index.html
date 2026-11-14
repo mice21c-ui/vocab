@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="apple-mobile-web-app-title" content="단어장">
+<meta name="theme-color" content="#0a0a0f">
+<link rel="apple-touch-icon" href="icon-vocab.png">
+<link rel="icon" href="icon-vocab.png">
+<title>Pain of Others 단어장</title>
+<style>html,body{margin:0;background:#0a0a0f;color-scheme:dark}body::before{content:"";position:fixed;top:0;left:0;right:0;height:env(safe-area-inset-top,0px);background:#0a0a0f;z-index:100}</style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+const SHEET_URL = "https://script.google.com/macros/s/AKfycbyZ2lvP3gbwF0iz5x9hw96la_S_MttlSvaHO9bqDdQApd-iEx_4AvPfJTCHD4BiEQgU/exec";
+const PROGRESS_KEY = "vocab_progress_v3";
+const PENDING_KEY = "vocab_pending_v3";
+const WORDS_CACHE_KEY = "vocab_words_cache_v3";
+const lsGet = (k, d) => { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} };
+
+const TABS = ["목록", "카드", "퀴즈"];
+
+function getKoVoice() { return window.speechSynthesis.getVoices().find(v => v.lang.startsWith("ko")) || null; }
+function getEnVoice() { return window.speechSynthesis.getVoices().find(v => v.lang.startsWith("en")) || null; }
+
+function speakSegment(text, lang) {
+  return new Promise(resolve => {
+    if (!window.speechSynthesis || !text) { resolve(); return; }
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = lang.startsWith("ko") ? "ko-KR" : "en-US";
+    u.rate = lang.startsWith("ko") ? 0.85 : 0.82;
+    const v = lang.startsWith("ko") ? getKoVoice() : getEnVoice();
+    if (v) u.voice = v;
+    u.onend = resolve; u.onerror = resolve;
+    window.speechSynthesis.speak(u);
+  });
+}
+
+async function speakWordAndMeaning(w) {
+  window.speechSynthesis.cancel();
+  await new Promise(r => setTimeout(r, 100));
+  await speakSegment(w.word, "en");
+  await new Promise(r => setTimeout(r, 200));
+  if (w.meaning) await speakSegment(w.meaning, "ko");
+}
+
+function speakWordOnly(word) {
+  window.speechSynthesis.cancel();
+  speakSegment(word, "en");
+}
+
+function VocabApp() {
+  const [words, setWords] = useState([]);
+  const [ready, setReady] = useState(false);
+  const [tab, setTab] = useState(0);
+  const [filter, setFilter] = useState("all");
+  const [cardIdx, setCardIdx] = useState(0);
+  const [flipped, setFlipped] = useState(false);
+  const [slide, setSlide] = useState(null);
+  const [quizIdx, setQuizIdx] = useState(0);
+  const [showAns, setShowAns] = useState(false);
+  const [delId, setDelId] = useState(null);
+  const [bulkConfirm, setBulkConfirm] = useState(false);
+  const [toast, setToast] = useState("");
+  const [reading, setReading] = useState(false);
+  const [readIdx, setReadIdx] = useState(-1);
+  const [showBackup, setShowBackup] = useState(false);
+  const [backupTab, setBackupTab] = useState("export");
+  const [importText, setImportText] = useState("");
+  const [importMsg, setImportMsg] = useState("");
+  const stopRef = useRef(false);
+  const touchStartX = useRef(0);
+  const touchStartY = useRef(0);
+  const swipeDetected = useRef(false);
+  const isAnimating = useRef(false);
+
+  const baseRef = useRef(lsGet(WORDS_CACHE_KEY, []));
+  const progRef = useRef(lsGet(PROGRESS_KEY, {}));
+  const pendRef = useRef(lsGet(PENDING_KEY, {}));
+  const syncTimer = useRef(null);
+  const [syncMsg, setSyncMsg] = useState("");
+
+  const rebuild = () => setWords(baseRef.current.map(w => {
+    const p = progRef.current[w.word] || {};
+    return { ...w, starred: !!p.starred, mastered: !!p.mastered };
+  }));
+  const pendingCount = () => Object.keys(pendRef.current).length;
+  const saveLocal = () => { lsSet(PROGRESS_KEY, progRef.current); lsSet(PENDING_KEY, pendRef.current); };
+
+  const flush = async () => {
+    const list = Object.entries(pendRef.current).map(([word, v]) => ({ word, starred: v.starred ? 1 : 0, mastered: v.mastered ? 1 : 0 }));
+    if (!list.length || SHEET_URL.indexOf("http") !== 0) return;
+    try { await fetch(SHEET_URL, { method: "POST", mode: "no-cors", body: JSON.stringify({ changes: list }) }); } catch (e) {}
+  };
+
+  const sync = async () => {
+    if (SHEET_URL.indexOf("http") !== 0) { setSyncMsg("⚠ 시트 주소 없음"); return; }
+    try {
+      const r = await fetch(SHEET_URL + "?t=" + Date.now());
+      const data = await r.json();
+      if (!data || !Array.isArray(data.words)) throw new Error("bad");
+      baseRef.current = data.words;
+      lsSet(WORDS_CACHE_KEY, data.words);
+      const next = {};
+      (data.state || []).forEach(s => {
+        if (!s || typeof s.word !== "string") return;
+        next[s.word] = { starred: Number(s.starred) === 1, mastered: Number(s.mastered) === 1 };
+      });
+      Object.keys(pendRef.current).forEach(word => {
+        const p = pendRef.current[word];
+        const rem = next[word] || { starred: false, mastered: false };
+        if (rem.starred === !!p.starred && rem.mastered === !!p.mastered) delete pendRef.current[word];
+        else next[word] = { starred: !!p.starred, mastered: !!p.mastered };
+      });
+      progRef.current = next;
+      saveLocal();
+      rebuild();
+      if (pendingCount() > 0) { setSyncMsg("⏳ " + pendingCount() + "개 전송 중"); await flush(); schedSync(); }
+      else setSyncMsg("☁ 동기화됨");
+    } catch (e) {
+      setSyncMsg(pendingCount() > 0 ? "📴 오프라인 · " + pendingCount() + "개 대기" : "📴 오프라인 (저장된 목록)");
+    }
+  };
+  const schedSync = () => { clearTimeout(syncTimer.current); syncTimer.current = setTimeout(sync, 3000); };
+
+  useEffect(() => {
+    rebuild();
+    setReady(true);
+    sync();
+    const onVis = () => { if (document.visibilityState === "visible") { flush(); sync(); } };
+    document.addEventListener("visibilitychange", onVis);
+    window.addEventListener("online", onVis);
+    return () => { document.removeEventListener("visibilitychange", onVis); window.removeEventListener("online", onVis); };
+  }, []);
+
+  const setProgress = (changes) => {
+    changes.forEach(c => {
+      const v = { starred: !!c.starred, mastered: !!c.mastered };
+      progRef.current[c.word] = v;
+      pendRef.current[c.word] = v;
+    });
+    saveLocal();
+    rebuild();
+    setSyncMsg("⏳ " + pendingCount() + "개 전송 중");
+    flush();
+    schedSync();
+  };
+
+  const toast_ = (msg) => { setToast(msg); setTimeout(() => setToast(""), 2200); };
+  const toggle = (word, f) => {
+    const cur = words.find(w => w.word === word); if (!cur) return;
+    setProgress([{ word, starred: f === "starred" ? !cur.starred : cur.starred, mastered: f === "mastered" ? !cur.mastered : cur.mastered }]);
+  };
+  const markMastered = (word) => {
+    const cur = words.find(w => w.word === word); if (!cur) return;
+    setProgress([{ word, starred: cur.starred, mastered: true }]); toast_("암기완료! ✅");
+  };
+
+  const exportPayload = () => {
+    const progress = words.filter(w => w.starred || w.mastered).map(w => ({ word: w.word, starred: !!w.starred, mastered: !!w.mastered }));
+    return JSON.stringify({ v: 1, progress }, null, 0);
+  };
+  const copyExport = async () => {
+    const text = exportPayload();
+    try {
+      await navigator.clipboard.writeText(text);
+      toast_("복사됐어요 📋");
+    } catch {
+      toast_("복사에 실패했어요. 직접 선택해 복사해주세요.");
+    }
+  };
+  const runImport = async () => {
+    setImportMsg("");
+    let parsed;
+    try { parsed = JSON.parse(importText); } catch { setImportMsg("올바른 형식이 아니에요. 내보내기한 코드를 그대로 붙여넣어주세요."); return; }
+    const list = Array.isArray(parsed) ? parsed : parsed.progress;
+    if (!Array.isArray(list)) { setImportMsg("올바른 형식이 아니에요."); return; }
+    const byWord = {};
+    for (const item of list) { if (item && item.word) byWord[item.word] = item; }
+    const changes = [];
+    baseRef.current.forEach(w => {
+      const found = byWord[w.word];
+      if (found) changes.push({ word: w.word, starred: !!found.starred, mastered: !!found.mastered });
+    });
+    if (changes.length) setProgress(changes);
+    const matchedCount = changes.length;
+    setImportMsg(`${matchedCount}개 단어의 기록을 불러왔어요.`);
+    toast_("가져오기 완료! ✅");
+  };
+
+  const filtered = words.filter(w =>
+    filter === "starred" ? w.starred && !w.mastered :
+    filter === "mastered" ? w.mastered : !w.mastered
+  );
+  const quizW = words.filter(w => !w.mastered);
+  const masteredCount = words.filter(w => w.mastered).length;
+  const ci = filtered.length ? cardIdx % filtered.length : 0;
+  const qi = quizW.length ? quizIdx % quizW.length : 0;
+
+  const goCard = (dir) => {
+    if (isAnimating.current || !filtered.length) return;
+    isAnimating.current = true;
+    setFlipped(false);
+    setSlide({ dir, phase: "out" });
+    setTimeout(() => {
+      setCardIdx(i => dir === "left" ? (i + 1) % filtered.length : (i - 1 + filtered.length) % filtered.length);
+      setSlide({ dir, phase: "waiting" });
+      setTimeout(() => {
+        setSlide({ dir, phase: "in" });
+        setTimeout(() => { setSlide(null); isAnimating.current = false; }, 280);
+      }, 20);
+    }, 260);
+  };
+
+  const getCardTransform = () => {
+    if (!slide) return { transform: "translateX(0)", opacity: 1, transition: "none" };
+    if (slide.phase === "out") return { transform: slide.dir === "left" ? "translateX(-110%)" : "translateX(110%)", opacity: 0, transition: "transform 0.26s ease, opacity 0.26s ease" };
+    if (slide.phase === "waiting") return { transform: slide.dir === "left" ? "translateX(110%)" : "translateX(-110%)", opacity: 0, transition: "none" };
+    if (slide.phase === "in") return { transform: "translateX(0)", opacity: 1, transition: "transform 0.28s ease, opacity 0.28s ease" };
+    return { transform: "translateX(0)", opacity: 1, transition: "none" };
+  };
+
+  const onTouchStart = (e) => { touchStartX.current = e.touches[0].clientX; touchStartY.current = e.touches[0].clientY; swipeDetected.current = false; };
+  const onTouchMove = (e) => { const dx = Math.abs(e.touches[0].clientX - touchStartX.current); const dy = Math.abs(e.touches[0].clientY - touchStartY.current); if (dx > dy && dx > 15) swipeDetected.current = true; };
+  const onTouchEnd = (e) => {
+    if (!swipeDetected.current) return;
+    const dx = e.changedTouches[0].clientX - touchStartX.current;
+    if (Math.abs(dx) < 50) return;
+    goCard(dx < 0 ? "left" : "right");
+  };
+  const onCardTap = () => { if (swipeDetected.current) return; setFlipped(f => !f); };
+
+  const readAll = async () => {
+    const list = filtered; if (!list.length) return;
+    stopRef.current = false; setReading(true);
+    for (let i = 0; i < list.length; i++) {
+      if (stopRef.current) break;
+      setReadIdx(i);
+      await speakWordAndMeaning(list[i]);
+      if (stopRef.current) break;
+      await new Promise(r => setTimeout(r, 500));
+    }
+    setReading(false); setReadIdx(-1);
+  };
+  const stopRead = () => { stopRef.current = true; window.speechSynthesis.cancel(); setReading(false); setReadIdx(-1); };
+
+  if (!ready) return (
+    <div style={{ background: "#0a0a0f", minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", color: "#d4af6a", fontFamily: "Georgia, serif", fontSize: 16 }}>
+      불러오는 중…
+    </div>
+  );
+
+  return (
+    <div style={{ fontFamily: "'Noto Serif KR', Georgia, serif", background: "#0a0a0f", minHeight: "100vh", color: "#e8e0d0", maxWidth: 480, margin: "0 auto", position: "relative" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@400;600;700&family=Cormorant+Garamond:ital,wght@0,600;0,700;1,400;1,600&display=swap');
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        ::-webkit-scrollbar { width: 3px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: #d4af6a44; border-radius: 2px; }
+
+        .tab-btn {
+          flex: 1; padding: 12px 0; border: none; cursor: pointer;
+          font-family: 'Noto Serif KR', serif; font-size: 14px;
+          background: transparent; border-bottom: 2px solid transparent;
+          transition: all 0.2s; letter-spacing: 1px;
+        }
+        .tab-btn.on { color: #d4af6a; border-bottom-color: #d4af6a; font-weight: 700; }
+        .tab-btn.off { color: #6b6b7d; }
+        .tab-btn.off:hover { color: #9a9aac; }
+
+        .filter-btn {
+          padding: 6px 14px; border-radius: 20px; border: 1px solid #23233a;
+          cursor: pointer; font-family: 'Noto Serif KR', serif; font-size: 12px;
+          transition: all 0.2s; letter-spacing: 0.5px;
+        }
+        .filter-btn.on { background: #d4af6a; color: #0a0a0f; border-color: #d4af6a; font-weight: 700; }
+        .filter-btn.off { background: transparent; color: #8888a0; border-color: #23233a; }
+        .filter-btn.off:hover { border-color: #d4af6a44; color: #b0b0c4; }
+
+        .word-card {
+          background: #0f0f1a; border-radius: 14px; padding: 18px 20px;
+          margin-bottom: 10px; border: 1px solid #1a1a2a;
+          transition: border-color 0.3s, background 0.3s;
+        }
+        .word-card.active { border-color: #d4af6a55; background: #13110a; }
+        .word-card:hover { border-color: #2a2a4a; }
+
+        .icon-btn {
+          background: none; border: none; cursor: pointer;
+          padding: 4px 6px; border-radius: 6px; font-size: 17px;
+          line-height: 1; transition: transform 0.15s;
+        }
+        .icon-btn:active { transform: scale(1.25); }
+
+        .primary-btn {
+          padding: 13px 28px; border-radius: 10px; border: none;
+          background: linear-gradient(135deg, #d4af6a, #a8833a);
+          color: #0a0a0f; font-family: 'Noto Serif KR', serif;
+          font-size: 15px; font-weight: 700; cursor: pointer;
+          letter-spacing: 0.5px; transition: opacity 0.2s;
+        }
+        .primary-btn:hover { opacity: 0.9; }
+
+        .secondary-btn {
+          padding: 11px 22px; border-radius: 10px;
+          border: 1px solid #23233a; background: transparent;
+          color: #a0a0b4; font-family: 'Noto Serif KR', serif;
+          font-size: 13px; cursor: pointer; transition: all 0.2s;
+        }
+        .secondary-btn:hover { border-color: #d4af6a44; color: #cacada; }
+        .secondary-btn:active { border-color: #d4af6a; color: #d4af6a; }
+
+        .delete-btn {
+          padding: 11px 24px; border-radius: 10px;
+          border: 1px solid #4a2222; background: transparent;
+          color: #d67a7a; font-family: 'Noto Serif KR', serif;
+          font-size: 13px; cursor: pointer; width: 100%; margin-top: 8px;
+          transition: all 0.2s;
+        }
+        .delete-btn:hover { border-color: #e0605055; color: #e08080; }
+
+        .modal-bg {
+          position: fixed; inset: 0; background: rgba(0,0,0,0.85);
+          display: flex; align-items: center; justify-content: center;
+          z-index: 60; padding: 24px;
+        }
+        .modal-box {
+          background: #0f0f1a; border-radius: 18px; padding: 28px 24px;
+          width: 100%; max-width: 300px; text-align: center;
+          border: 1px solid #1e1e2e;
+        }
+
+        .toast {
+          position: fixed; bottom: 30px; left: 50%;
+          transform: translateX(-50%);
+          background: linear-gradient(135deg, #d4af6a, #a8833a);
+          color: #0a0a0f; padding: 10px 24px; border-radius: 10px;
+          font-size: 14px; font-weight: 700; z-index: 100;
+          white-space: nowrap; pointer-events: none;
+          animation: fadeUp 0.3s ease;
+        }
+        @keyframes fadeUp {
+          from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+          to { opacity: 1; transform: translateX(-50%) translateY(0); }
+        }
+
+        .mastered-btn {
+          padding: 8px 18px; border-radius: 8px; border: none;
+          background: #1a2e1a; color: #9ad89a;
+          font-family: 'Noto Serif KR', serif; font-size: 13px;
+          cursor: pointer; flex-shrink: 0; transition: background 0.2s;
+        }
+        .mastered-btn:hover { background: #223a22; }
+
+        .quiz-box {
+          background: #0f0f1a; border-radius: 16px; padding: 36px 24px;
+          text-align: center; border: 1px solid #1a1a2a;
+          display: flex; flex-direction: column; align-items: center;
+          justify-content: center; gap: 16px; min-height: 240px;
+        }
+
+        .stop-overlay { position: fixed; inset: 0; z-index: 29; cursor: pointer; }
+
+        .reading-bar {
+          background: #13110a; border: 1px solid #d4af6a33;
+          border-radius: 8px; padding: 10px 16px; font-size: 13px;
+          color: #d4af6a; display: flex; justify-content: space-between;
+          margin-bottom: 12px; align-items: center;
+        }
+
+        .card-face {
+          position: absolute; width: 100%; height: 100%;
+          backface-visibility: hidden; -webkit-backface-visibility: hidden;
+          border-radius: 18px; display: flex; flex-direction: column;
+          align-items: center; justify-content: center;
+          gap: 10px; padding: 28px;
+        }
+        .card-front {
+          background: linear-gradient(145deg, #0f0f1e, #1a1428);
+          border: 1px solid #2a2040;
+        }
+        .card-back {
+          background: linear-gradient(145deg, #0f1a0f, #141f14);
+          border: 1px solid #1e2e1e;
+          transform: rotateY(180deg);
+          justify-content: flex-start;
+          padding-top: 24px;
+          overflow-y: auto;
+        }
+
+        .divider {
+          width: 40px; height: 1px;
+          background: linear-gradient(90deg, transparent, #d4af6a55, transparent);
+          margin: 4px auto;
+        }
+      `}</style>
+
+      {reading && <div className="stop-overlay" onClick={stopRead} />}
+
+      {/* Header */}
+      <div style={{ padding: "32px 24px 18px", borderBottom: "1px solid #1a1a2a" }}>
+        <div style={{ fontSize: 10, letterSpacing: 6, color: "#d4af6a88", marginBottom: 8, textTransform: "uppercase" }}>Reading Journal</div>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
+          <div style={{ fontFamily: "'Cormorant Garamond', serif", fontSize: 38, fontWeight: 700, letterSpacing: -0.5, lineHeight: 1 }}>
+            단어장
+          </div>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 10 }}>
+            <div style={{ fontSize: 12, color: "#6a6a7e", textAlign: "right", lineHeight: 1.6 }}>
+              <div>총 {words.length}개</div>
+              <div style={{ color: "#d4af6a99" }}>완료 {masteredCount}개</div>
+              <div style={{ fontSize: 10 }}>{syncMsg}</div>
+            </div>
+          </div>
+        </div>
+        {/* Progress bar */}
+        <div style={{ marginTop: 14, height: 2, background: "#1a1a2a", borderRadius: 1 }}>
+          <div style={{
+            height: "100%", borderRadius: 1,
+            background: "linear-gradient(90deg, #d4af6a, #a8833a)",
+            width: `${words.length ? (masteredCount / words.length) * 100 : 0}%`,
+            transition: "width 0.4s ease"
+          }} />
+        </div>
+      </div>
+
+      {/* Tabs */}
+      <div style={{ display: "flex", borderBottom: "1px solid #1a1a2a", position: "sticky", top: 0, background: "#0a0a0f", zIndex: 10 }}>
+        {TABS.map((t, i) => (
+          <button key={t} className={`tab-btn ${tab === i ? "on" : "off"}`}
+            onClick={() => { setTab(i); stopRead(); }}>{t}</button>
+        ))}
+      </div>
+
+      {/* LIST TAB */}
+      {tab === 0 && (
+        <div>
+          <div style={{
+            position: "sticky", top: 43, background: "#0a0a0f", zIndex: 9,
+            padding: "10px 20px 8px", borderBottom: "1px solid #1a1a2a11",
+            display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center"
+          }}>
+            {[["all", "전체"], ["starred", "⭐ 즐겨찾기"], ["mastered", "✅ 완료"]].map(([v, l]) => (
+              <button key={v} className={`filter-btn ${filter === v ? "on" : "off"}`}
+                onClick={() => { setFilter(v); stopRead(); }}>{l}</button>
+            ))}
+            <button className={`filter-btn ${reading ? "on" : "off"}`}
+              style={reading ? { background: "#d4af6a", color: "#0a0a0f" } : { borderColor: "#2a2040", color: "#a89adb" }}
+              onClick={reading ? stopRead : readAll}>
+              {reading ? "⏹ 정지" : "🔈 전체"}
+            </button>
+          </div>
+
+          <div style={{ padding: "12px 20px" }}>
+            {reading && readIdx >= 0 && readIdx < filtered.length && (
+              <div className="reading-bar">
+                <span>🔈 {readIdx + 1}/{filtered.length} — <strong style={{ color: "#d4af6a" }}>{filtered[readIdx]?.word}</strong></span>
+                <span style={{ fontSize: 11, color: "#d4af6a99" }}>탭 → 정지</span>
+              </div>
+            )}
+
+            {filtered.length === 0 && (
+              <div style={{ textAlign: "center", color: "#5a5a6e", padding: "60px 0", fontSize: 14, lineHeight: 2.5 }}>
+                {filter === "all" ? "🎉 모든 단어를 외웠어요!" : "해당하는 단어가 없어요"}
+              </div>
+            )}
+
+            {filtered.map((w, idx) => (
+              <div key={w.id} className={`word-card ${readIdx === idx ? "active" : ""}`}>
+                <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1 }}>
+                    <span style={{
+                      fontFamily: "'Cormorant Garamond', serif",
+                      fontSize: 26, fontWeight: 700,
+                      color: w.mastered ? "#4a4a5e" : "#e8e0d0",
+                      letterSpacing: -0.3
+                    }}>{w.word}</span>
+                    <button className="icon-btn" onClick={() => speakWordAndMeaning(w)}>🔊</button>
+                  </div>
+                  <div style={{ display: "flex", gap: 1, flexShrink: 0 }}>
+                    <button className="icon-btn" onClick={() => toggle(w.word, "starred")}>{w.starred ? "⭐" : "☆"}</button>
+                    <button className="icon-btn" onClick={() => toggle(w.word, "mastered")}>{w.mastered ? "✅" : "○"}</button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 14, color: "#d4af6a", marginBottom: 8, lineHeight: 1.5, fontWeight: 600 }}>{w.meaning}</div>
+                {w.example_en && <div style={{ fontSize: 12, color: "#b4b4cc", fontStyle: "italic", marginBottom: 3, lineHeight: 1.6 }}>{w.example_en}</div>}
+                {w.example_ko && <div style={{ fontSize: 12, color: "#d6d6e6", marginBottom: 8, lineHeight: 1.6 }}>{w.example_ko}</div>}
+                {w.tip && (
+                  <div style={{ fontSize: 12, color: "#b8a8e8", background: "#181430", borderRadius: 6, padding: "6px 10px", lineHeight: 1.5 }}>
+                    💡 {w.tip}
+                  </div>
+                )}
+              </div>
+            ))}
+
+          </div>
+        </div>
+      )}
+
+      {/* CARD TAB */}
+      {tab === 1 && (
+        <div style={{ padding: "16px 20px" }}>
+          {filtered.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#5a5a6e", padding: "60px 0", fontSize: 14 }}>단어를 추가해보세요!</div>
+          ) : (
+            <>
+              <div style={{ textAlign: "center", fontSize: 12, color: "#5a5a6e", marginBottom: 2 }}>{ci + 1} / {filtered.length}</div>
+              <div style={{ textAlign: "center", fontSize: 11, color: "#45455a", marginBottom: 14, letterSpacing: 0.5 }}>← 스와이프로 넘기기 · 탭해서 뒤집기</div>
+
+              <div style={{ overflow: "hidden", borderRadius: 18, height: 340, marginBottom: 16, position: "relative" }}>
+                <div style={{
+                  ...getCardTransform(), height: "100%", cursor: "pointer",
+                  userSelect: "none", WebkitUserSelect: "none",
+                  touchAction: "pan-y", perspective: "1000px", position: "relative"
+                }}
+                  onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd} onClick={onCardTap}>
+                  <div style={{
+                    position: "relative", width: "100%", height: "100%",
+                    transformStyle: "preserve-3d",
+                    transition: "transform 0.5s cubic-bezier(.4,0,.2,1)",
+                    transform: flipped ? "rotateY(180deg)" : "rotateY(0deg)"
+                  }}>
+                    {/* Front */}
+                    <div className="card-face card-front">
+                      <div style={{ fontSize: 11, letterSpacing: 4, color: "#5a4d80", marginBottom: 4, textTransform: "uppercase" }}>Word</div>
+                      <div className="divider" />
+                      <div style={{ fontFamily: "'Cormorant Garamond', serif", fontSize: 50, fontWeight: 700, textAlign: "center", letterSpacing: -1, lineHeight: 1.1 }}>
+                        {filtered[ci]?.word}
+                      </div>
+                      <button className="icon-btn" style={{ fontSize: 22 }}
+                        onClick={e => { e.stopPropagation(); speakWordOnly(filtered[ci]?.word); }}>🔊</button>
+                      <div style={{ fontSize: 12, color: "#5a4d80", marginTop: 8, letterSpacing: 1 }}>탭해서 뜻 보기</div>
+                    </div>
+                    {/* Back */}
+                    <div className="card-face card-back" onClick={e => e.stopPropagation()}>
+                      <div style={{ width: "100%", overflowY: "auto", maxHeight: 295, display: "flex", flexDirection: "column", gap: 10, alignItems: "center" }}>
+                        <div style={{ fontSize: 11, letterSpacing: 4, color: "#4d7a4d", textTransform: "uppercase" }}>Meaning</div>
+                        <div className="divider" style={{ background: "linear-gradient(90deg, transparent, #7ab87a55, transparent)" }} />
+                        <div style={{ fontSize: 22, fontWeight: 700, color: "#8fd68f", textAlign: "center", lineHeight: 1.4 }}>{filtered[ci]?.meaning}</div>
+                        {filtered[ci]?.example_en && (
+                          <div style={{ fontSize: 13, color: "#b8dab8", fontStyle: "italic", textAlign: "center", lineHeight: 1.6 }}>{filtered[ci]?.example_en}</div>
+                        )}
+                        {filtered[ci]?.example_ko && (
+                          <div style={{ fontSize: 12, color: "#dcefdc", textAlign: "center", lineHeight: 1.6 }}>{filtered[ci]?.example_ko}</div>
+                        )}
+                        {filtered[ci]?.tip && (
+                          <div style={{ fontSize: 12, color: "#b8a8e8", textAlign: "center", background: "#181430", borderRadius: 8, padding: "6px 12px", lineHeight: 1.5 }}>
+                            💡 {filtered[ci]?.tip}
+                          </div>
+                        )}
+                        <div style={{ display: "flex", gap: 12, marginTop: 6, alignItems: "center" }}>
+                          <button className="icon-btn" style={{ fontSize: 20 }}
+                            onClick={e => { e.stopPropagation(); speakWordAndMeaning(filtered[ci]); }}>🔊</button>
+                          <button className="mastered-btn"
+                            onClick={e => { e.stopPropagation(); markMastered(filtered[ci].word); goCard("left"); }}>
+                            ✅ 외웠어요
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: 10 }}>
+                <button className="secondary-btn" style={{ flex: 1 }} onClick={() => goCard("right")}>← 이전</button>
+                <button className="secondary-btn" style={{ flex: 1 }} onClick={() => goCard("left")}>다음 →</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* QUIZ TAB */}
+      {tab === 2 && (
+        <div style={{ padding: "16px 20px" }}>
+          {quizW.length === 0 ? (
+            <div style={{ textAlign: "center", color: "#5a5a6e", padding: "60px 0", fontSize: 14 }}>
+              🎉 모든 단어를 외웠어요!
+            </div>
+          ) : (
+            <>
+              <div style={{ fontSize: 12, color: "#5a5a6e", textAlign: "center", marginBottom: 14, letterSpacing: 1 }}>
+                남은 단어 {quizW.length}개
+              </div>
+              <div className="quiz-box">
+                <div style={{ fontSize: 10, letterSpacing: 4, color: "#5a4d80", textTransform: "uppercase" }}>이 단어의 뜻은?</div>
+                <div className="divider" />
+                <div style={{ fontFamily: "'Cormorant Garamond', serif", fontSize: 48, fontWeight: 700, letterSpacing: -1 }}>
+                  {quizW[qi]?.word}
+                </div>
+                <button className="icon-btn" style={{ fontSize: 22 }} onClick={() => speakWordOnly(quizW[qi]?.word)}>🔊</button>
+                {showAns ? (
+                  <>
+                    <div className="divider" style={{ background: "linear-gradient(90deg, transparent, #7ab87a55, transparent)" }} />
+                    <div style={{ fontSize: 20, color: "#8fd68f", fontWeight: 700, textAlign: "center", lineHeight: 1.4 }}>{quizW[qi]?.meaning}</div>
+                    <div style={{ fontSize: 13, color: "#c8e6c8", fontStyle: "italic", textAlign: "center", lineHeight: 1.6 }}>{quizW[qi]?.example_ko}</div>
+                    {quizW[qi]?.tip && (
+                      <div style={{ fontSize: 12, color: "#b8a8e8", background: "#181430", borderRadius: 8, padding: "6px 14px", textAlign: "center" }}>
+                        💡 {quizW[qi]?.tip}
+                      </div>
+                    )}
+                    <div style={{ display: "flex", gap: 10, marginTop: 4 }}>
+                      <button className="secondary-btn"
+                        onClick={async () => { await markMastered(quizW[qi].word); setShowAns(false); setQuizIdx(i => i + 1); }}>
+                        ✅ 외웠어요
+                      </button>
+                      <button className="secondary-btn" onClick={() => { setShowAns(false); setQuizIdx(i => i + 1); }}>
+                        다음 →
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <button className="primary-btn" onClick={() => setShowAns(true)}>정답 보기</button>
+                )}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* Backup (Export/Import) Modal */}
+      {showBackup && (
+        <div className="modal-bg" onClick={() => setShowBackup(false)}>
+          <div className="modal-box" style={{ maxWidth: 380, textAlign: "left" }} onClick={e => e.stopPropagation()}>
+            <div style={{ fontSize: 18, fontWeight: 700, marginBottom: 4, fontFamily: "'Cormorant Garamond', serif", textAlign: "center" }}>
+              기록 백업
+            </div>
+            <div style={{ fontSize: 12, color: "#8888a0", marginBottom: 16, textAlign: "center" }}>
+              새 아티팩트로 옮길 때 암기·즐겨찾기 기록을 지켜줘요
+            </div>
+            <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+              <button className={`filter-btn ${backupTab === "export" ? "on" : "off"}`} style={{ flex: 1 }}
+                onClick={() => setBackupTab("export")}>내보내기</button>
+              <button className={`filter-btn ${backupTab === "import" ? "on" : "off"}`} style={{ flex: 1 }}
+                onClick={() => setBackupTab("import")}>가져오기</button>
+            </div>
+
+            {backupTab === "export" ? (
+              <>
+                <div style={{ fontSize: 12, color: "#a0a0b4", marginBottom: 8 }}>
+                  즐겨찾기·암기 표시된 {words.filter(w => w.starred || w.mastered).length}개 단어의 기록입니다. 복사해서 어딘가에 저장해두세요.
+                </div>
+                <textarea readOnly value={exportPayload()}
+                  style={{ width: "100%", height: 110, fontSize: 11, fontFamily: "monospace", background: "#0a0a0f", color: "#a8a8c2", border: "1px solid #23233a", borderRadius: 8, padding: 10, resize: "none", boxSizing: "border-box" }}
+                  onFocus={e => e.target.select()} />
+                <button className="primary-btn" style={{ width: "100%", marginTop: 12 }} onClick={copyExport}>📋 복사하기</button>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 12, color: "#a0a0b4", marginBottom: 8 }}>
+                  이전에 내보내기한 코드를 아래에 붙여넣으세요.
+                </div>
+                <textarea value={importText} onChange={e => setImportText(e.target.value)}
+                  placeholder='{"v":1,"progress":[...]}'
+                  style={{ width: "100%", height: 110, fontSize: 11, fontFamily: "monospace", background: "#0a0a0f", color: "#e8e0d0", border: "1px solid #23233a", borderRadius: 8, padding: 10, resize: "none", boxSizing: "border-box" }} />
+                {importMsg && <div style={{ fontSize: 12, color: "#d4af6a", marginTop: 8 }}>{importMsg}</div>}
+                <button className="primary-btn" style={{ width: "100%", marginTop: 12 }} onClick={runImport} disabled={!importText.trim()}>⬇ 가져오기</button>
+              </>
+            )}
+
+            <button className="secondary-btn" style={{ width: "100%", marginTop: 10 }} onClick={() => setShowBackup(false)}>닫기</button>
+          </div>
+        </div>
+      )}
+
+      {/* Delete Modal */}
+      {delId && (
+        <div className="modal-bg">
+          <div className="modal-box">
+            <div style={{ fontSize: 28, marginBottom: 12 }}>🗑️</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6, fontFamily: "'Cormorant Garamond', serif" }}>삭제할까요?</div>
+            <div style={{ fontSize: 13, color: "#8888a0", marginBottom: 20 }}>복구할 수 없어요</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="secondary-btn" style={{ flex: 1 }} onClick={() => setDelId(null)}>취소</button>
+              <button onClick={() => del(delId)}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#3a1a1a", color: "#e08080", fontFamily: "'Noto Serif KR', serif", fontSize: 13, cursor: "pointer" }}>
+                삭제
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Delete Modal */}
+      {bulkConfirm && (
+        <div className="modal-bg">
+          <div className="modal-box">
+            <div style={{ fontSize: 28, marginBottom: 12 }}>🗑️</div>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 6, fontFamily: "'Cormorant Garamond', serif" }}>
+              외운 단어 {masteredCount}개를<br />모두 삭제할까요?
+            </div>
+            <div style={{ fontSize: 13, color: "#8888a0", marginBottom: 20 }}>복구할 수 없어요</div>
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="secondary-btn" style={{ flex: 1 }} onClick={() => setBulkConfirm(false)}>취소</button>
+              <button onClick={bulkDel}
+                style={{ flex: 1, padding: "10px", borderRadius: 10, border: "none", background: "#3a1a1a", color: "#e08080", fontFamily: "'Noto Serif KR', serif", fontSize: 13, cursor: "pointer" }}>
+                전체 삭제
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && <div className="toast">{toast}</div>}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<VocabApp/>);
+</script>
+</body>
+</html>
